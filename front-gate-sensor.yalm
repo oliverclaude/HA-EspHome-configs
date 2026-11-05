@@ -1,0 +1,276 @@
+# =============================================================================
+# Oliver - Centurion Vantage dual swing gate, via MyCentsys Pro BLE
+# ESP32-S3-WROOM-2-N32R16V (MCN32R16V) inside the gate controller housing, 5V USB-C from a 9-60V
+# converter on the controller's 12V aux output.
+#
+# Protocol reverse-engineered in /workspace/gate/RECON.md. Lives in the local
+# external component ./components/centurion_gate.
+#
+# Only ONE BLE central can talk to the gate at a time. Turn off
+# "BLE Connection Enabled" before you use the MyCentsys Pro phone app.
+# =============================================================================
+substitutions:
+  devicename: front-gate-sensor-esp32
+  friendly: Front Gate Sensor
+
+esphome:
+  name: ${devicename}
+  friendly_name: ${friendly}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 32MB
+  framework:
+    type: esp-idf
+    advanced:
+      enable_idf_experimental_features: true
+    sdkconfig_options:
+      CONFIG_ESPTOOLPY_FLASHMODE_OPI: y
+      CONFIG_ESPTOOLPY_FLASHSIZE_32MB: y
+      CONFIG_SPIRAM_MODE_OCT: y
+      CONFIG_SPIRAM_SPEED_80M: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+preferences:
+  flash_write_interval: 1min
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret encryption_key
+  reboot_timeout: 0s   # don't reboot just because HA/API is down
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: light
+  reboot_timeout: 15min
+  ap:
+    ssid: "${devicename}"
+    password: !secret ap_password
+
+captive_portal:
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [centurion_gate]
+
+# --- BLE ---------------------------------------------------------------------
+esp32_ble_tracker:
+  scan_parameters:
+    # Short, gentle scans: we only need to find the gate to (re)connect.
+    active: false
+    interval: 1100ms
+    window: 1100ms
+
+ble_client:
+  - mac_address: !secret centurion_mac
+    id: gate_ble
+    auto_connect: true
+
+centurion_gate:
+  id: frontgate
+  ble_client_id: gate_ble
+  # Enrolled phone number in the exact format the app uses (e.g. +27...).
+  # Never hardcode it here.
+  phone_number: !secret centurion_phone
+  # The cipher key defaults to the last 4 bytes of the MAC (xxxxxxxx), which
+  # matches the advert. Override only if needed:
+  # cipher_key: "xxxxxxx"
+  keepalive_interval: 8s
+
+  battery_voltage:
+    name: "Battery Voltage"
+  master_position:
+    name: "Master Leaf Position"
+  slave_position:
+    name: "Slave Leaf Position"
+  master_encoder:
+    name: "Master Encoder"
+    disabled_by_default: true
+  slave_encoder:
+    name: "Slave Encoder"
+    disabled_by_default: true
+  trigger_counter:
+    name: "Trigger Counter"
+  last_trigger:
+    name: "Last Trigger Index"
+    disabled_by_default: true
+
+  gate_status:
+    name: "Gate Status"
+  master_status:
+    name: "Master Leaf Status"
+  slave_status:
+    name: "Slave Leaf Status"
+  comms_version:
+    name: "Comms Firmware"
+  core_version:
+    name: "Core Firmware"
+  serial_number:
+    name: "Controller Serial"
+  health_general:
+    name: "Health General"
+  health_controller:
+    name: "Health Controller"
+  health_battery:
+    name: "Health Battery"
+  health_power_supply:
+    name: "Health Power Supply"
+  health_motors:
+    name: "Health Motors"
+
+  holiday_lock:
+    name: "Holiday Lock"
+  frx:
+    name: "FRX (Free Exit)"
+  keep_open:
+    name: "Keep Open"
+  mains_fail:
+    name: "Mains Failure"
+  power_low:
+    name: "Power Low"
+  irb_armed:
+    name: "IRB Alarms Armed"
+  beam_open:
+    name: "Beams Open"
+  gate_lock:
+    name: "Gate Lock"
+    disabled_by_default: true
+  fault:
+    name: "Gate Fault"
+  connected:
+    name: "Gate Connected"
+
+sensor:
+  - platform: ble_client
+    type: rssi
+    ble_client_id: gate_ble
+    name: "Gate BLE RSSI"
+    entity_category: diagnostic
+    update_interval: 60s
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+
+switch:
+  # Off = drop the BLE link so the MyCentsys Pro app can connect. Restored at boot.
+  - platform: template
+    name: "BLE Connection Enabled"
+    id: ble_connection_enabled
+    icon: "mdi:bluetooth-connect"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: id(frontgate).set_connection_enabled(true);
+    turn_off_action:
+      - lambda: id(frontgate).set_connection_enabled(false);
+
+button:
+  # ---- VERIFIED on frontgate 2026-11-03 ----
+  - platform: template
+    name: "TRG (Open-Close)"
+    icon: "mdi:gate"
+    on_press:
+      - lambda: id(frontgate).send_trigger(34);
+  - platform: template
+    name: "PED (Pedestrian)"
+    icon: "mdi:walk"
+    on_press:
+      - lambda: id(frontgate).send_trigger(35);
+  - platform: template
+    name: "Holiday Lock On"
+    icon: "mdi:lock"
+    on_press:
+      - lambda: id(frontgate).send_trigger(2);
+  - platform: template
+    name: "Holiday Lock Off"
+    icon: "mdi:lock-open-variant"
+    on_press:
+      - lambda: id(frontgate).send_trigger(3);
+  # ---- UNTESTED (from app code only); disabled in HA until tested live ----
+  - platform: template
+    name: "FRX On"            # UNTESTED TriggerInd 40
+    icon: "mdi:exit-run"
+    disabled_by_default: true
+    on_press:
+      - lambda: id(frontgate).send_trigger(40);
+  - platform: template
+    name: "FRX Off"           # UNTESTED TriggerInd 41
+    icon: "mdi:exit-run"
+    disabled_by_default: true
+    on_press:
+      - lambda: id(frontgate).send_trigger(41);
+  - platform: template
+    name: "Keep Open On"      # UNTESTED TriggerInd 5
+    icon: "mdi:gate-open"
+    disabled_by_default: true
+    on_press:
+      - lambda: id(frontgate).send_trigger(5);
+  - platform: template
+    name: "Keep Open Off"     # UNTESTED TriggerInd 6
+    icon: "mdi:gate"
+    disabled_by_default: true
+    on_press:
+      - lambda: id(frontgate).send_trigger(6);
+  - platform: template
+    name: "Gate Lock"         # UNTESTED TriggerInd 20 (electric lock)
+    icon: "mdi:lock-outline"
+    disabled_by_default: true
+    on_press:
+      - lambda: id(frontgate).send_trigger(20);
+  # ---- maintenance ----
+  - platform: template
+    name: "Refresh Gate Info"
+    entity_category: diagnostic
+    on_press:
+      - lambda: id(frontgate).request_info();
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+
+# Cover entity: open/close via TRG (34), state from the combined gate status.
+# TRG toggles, so open/close only fire when the gate is not already in or
+# moving to that state. Stop sends TRG while moving; on Centurion, TRG during
+# motion normally stops the gate (UNTESTED on frontgate).
+cover:
+  - platform: template
+    name: "Gate"
+    id: gate_cover
+    device_class: gate
+    lambda: |-
+      switch (id(frontgate).gate_status()) {
+        case 0: return COVER_OPEN;     // OPEN
+        case 1: return COVER_CLOSED;   // CLOSED
+        case 2: case 3: return 0.5f;   // PARTLY_OPEN / PARTLY_CLOSED
+        default: return {};            // moving / unknown: keep last
+      }
+    open_action:
+      - lambda: |-
+          uint8_t s = id(frontgate).gate_status();
+          if (s == 0 || s == 4) return;     // already open / opening
+          if (id(frontgate).holiday_lock()) { ESP_LOGW("gate", "Holiday lock is on"); return; }
+          id(frontgate).send_trigger(34);
+    close_action:
+      - lambda: |-
+          uint8_t s = id(frontgate).gate_status();
+          if (s == 1 || s == 5) return;     // already closed / closing
+          id(frontgate).send_trigger(34);
+    stop_action:
+      - lambda: |-
+          uint8_t s = id(frontgate).gate_status();
+          if (s == 4 || s == 5) id(frontgate).send_trigger(34);
