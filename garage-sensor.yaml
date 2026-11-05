@@ -1,0 +1,379 @@
+substitutions:
+  devicename: garage-sensor-esp32
+  friendly: "Garage Sensor"
+
+esphome:
+  name: ${devicename}
+  friendly_name: ${friendly}
+  on_boot:
+    priority: -100
+    then:
+      - output.turn_off: relay_output1
+      - output.turn_off: relay_output2
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+preferences:
+  flash_write_interval: 1min
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret encryption_key
+  reboot_timeout: 0s   # don’t reboot just because HA/API is down
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  reboot_timeout: 15min
+  ap:
+    ssid: ${devicename}
+    password: !secret ap_password
+    
+captive_portal:
+
+# Use numbers instead of text so you don't parse strings every second
+number:
+  - platform: template
+    name: "Door Open Distance"
+    id: open_distance
+    optimistic: true
+    restore_value: true
+    initial_value: 0.15
+    min_value: 0.00
+    max_value: 5.00
+    step: 0.01
+    unit_of_measurement: "m"
+    mode: box
+
+  - platform: template
+    name: "Door Closed Distance"
+    id: closed_distance
+    optimistic: true
+    restore_value: true
+    initial_value: 2.29
+    min_value: 0.00
+    max_value: 5.00
+    step: 0.01
+    unit_of_measurement: "m"
+    mode: box
+
+sensor:
+  - platform: dht
+    pin: GPIO19
+    model: DHT22
+    temperature:
+      name: "Temperature"
+      unit_of_measurement: "°C"
+    humidity:
+      name: "Humidity"
+    update_interval: 60s
+
+  - platform: ultrasonic
+    id: distance
+    trigger_pin: GPIO18
+    echo_pin: GPIO5
+    name: "Distance"
+    unit_of_measurement: "m"
+    update_interval: 1s
+    timeout: 5m
+    accuracy_decimals: 2
+    filters:
+      - lambda: |-
+          // Robust "hold last valid" + spike reject
+          static float last_valid = NAN;
+
+          if (isnan(x)) {
+            return last_valid;  // may still be NAN at boot
+          }
+
+          // Optional physical clamp (adjust for your install)
+          if (x < 0.05f || x > 4.50f) {
+            ESP_LOGD("ultra", "Rejected out-of-range: %.2f m", x);
+            return last_valid;
+          }
+
+          if (isnan(last_valid)) {
+            last_valid = x;
+            return x;
+          }
+
+          //if (fabsf(x - last_valid) > 1.0f) {
+          //  ESP_LOGD("ultra", "Rejected spike: %.2f m (from %.2f m)", x, last_valid);
+          //  return last_valid;
+          //}
+
+          last_valid = x;
+          return x;
+
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+  - platform: template
+    name: "Door Closed Percentage"
+    id: door_closed_percentage
+    unit_of_measurement: "%"
+    icon: "mdi:garage"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      if (!id(distance).has_state()) return NAN;
+      float current_dist = id(distance).state;
+      if (isnan(current_dist)) return NAN;
+
+      float min_dist = id(open_distance).state;    // open
+      float max_dist = id(closed_distance).state;  // closed
+
+      if (min_dist >= max_dist) {
+        ESP_LOGW("door", "Invalid thresholds: open %.2f >= closed %.2f", min_dist, max_dist);
+        return NAN;
+      }
+
+      float pct = ((current_dist - min_dist) / (max_dist - min_dist)) * 100.0f;
+      if (pct < 0.0f) pct = 0.0f;
+      if (pct > 100.0f) pct = 100.0f;
+      return pct;
+
+binary_sensor:
+  - platform: gpio
+    pin: GPIO21
+    name: "Motion"
+    device_class: motion
+    filters:
+      - delayed_off: 10s
+
+output:
+  - platform: gpio
+    pin: GPIO33
+    id: relay_output1
+    inverted: true
+
+  - platform: gpio
+    pin: GPIO32
+    id: relay_output2
+    inverted: true
+
+script:
+  - id: pulse_garage
+    mode: single
+    then:
+      - output.turn_on: relay_output1
+      - delay: 500ms
+      - output.turn_off: relay_output1
+
+  - id: pulse_relay2
+    mode: single
+    then:
+      - output.turn_on: relay_output2
+      - delay: 500ms
+      - output.turn_off: relay_output2
+
+button:
+  - platform: template
+    name: "Garage Button"
+    id: relay_button1
+    on_press:
+      - script.execute: pulse_garage
+
+  - platform: template
+    name: "Another Button"
+    id: relay_button2
+    on_press:
+      - script.execute: pulse_relay2
+
+  - platform: template
+    name: "Door Open Distance Set"
+    id: open_set_button
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(distance).has_state() || isnan(id(distance).state)) {
+              ESP_LOGW("custom", "Distance is NaN; not setting open distance");
+              return;
+            }
+            float current_dist = id(distance).state;
+            float rounded = roundf(current_dist * 100.0f) / 100.0f;  // 2 decimals
+            id(open_distance).publish_state(rounded);
+
+  - platform: template
+    name: "Door Closed Distance Set"
+    id: close_set_button
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(distance).has_state() || isnan(id(distance).state)) {
+              ESP_LOGW("custom", "Distance is NaN; not setting closed distance");
+              return;
+            }
+            float current_dist = id(distance).state;
+            float rounded = roundf(current_dist * 100.0f) / 100.0f;  // 2 decimals
+            id(closed_distance).publish_state(rounded);
+
+  - platform: template
+    name: "Door Fully Closed"
+    id: close_fully_button
+    on_press:
+      - lambda: |-
+          id(i_want_you_closed) = true;
+          id(i_want_you_open) = false;
+          id(previous_pct) = id(door_closed_percentage).has_state() ? id(door_closed_percentage).state : NAN;
+          id(request_start_ms) = millis();
+          id(wrong_way_streak) = 0;
+          id(stalled_streak) = 0;
+
+  - platform: template
+    name: "Door Fully Opened"
+    id: open_fully_button
+    on_press:
+      - lambda: |-
+          id(i_want_you_open) = true;
+          id(i_want_you_closed) = false;
+          id(previous_pct) = id(door_closed_percentage).has_state() ? id(door_closed_percentage).state : NAN;
+          id(request_start_ms) = millis();
+          id(wrong_way_streak) = 0;
+          id(stalled_streak) = 0;
+
+  - platform: template
+    name: "Cancel Door Command"
+    on_press:
+      - lambda: |-
+          id(i_want_you_open) = false;
+          id(i_want_you_closed) = false;
+
+globals:
+  - id: i_want_you_open
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: i_want_you_closed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: previous_pct
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+
+  - id: last_pulse_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: request_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: wrong_way_streak
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: stalled_streak
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+interval:
+  - interval: 3000ms
+    then:
+      - lambda: |-
+          const bool want_closed = id(i_want_you_closed);
+          const bool want_open   = id(i_want_you_open);
+
+          if (!want_closed && !want_open) return;
+
+          if (!id(door_closed_percentage).has_state()) {
+            ESP_LOGW("door", "No door percentage yet; aborting command");
+            id(i_want_you_closed) = false;
+            id(i_want_you_open) = false;
+            return;
+          }
+
+          const uint32_t now = millis();
+
+          // Hard safety timeout (e.g. 3 minutes)
+          if (id(request_start_ms) != 0 && (now - id(request_start_ms) > 180000)) {
+            ESP_LOGW("door", "Command timed out; cancelling");
+            id(i_want_you_closed) = false;
+            id(i_want_you_open) = false;
+            return;
+          }
+
+          float current = id(door_closed_percentage).state;
+          if (isnan(current)) return;
+
+          // Done thresholds
+          if (want_closed && current >= 98.0f) {
+            ESP_LOGI("door", "Reached closed target (%.1f%%).", current);
+            id(i_want_you_closed) = false;
+            id(previous_pct) = NAN;
+            return;
+          }
+          if (want_open && current <= 2.0f) {
+            ESP_LOGI("door", "Reached open target (%.1f%%).", current);
+            id(i_want_you_open) = false;
+            id(previous_pct) = NAN;
+            return;
+          }
+
+          // If we don't have a previous value yet, just store and wait for next tick
+          if (isnan(id(previous_pct))) {
+            id(previous_pct) = current;
+            return;
+          }
+
+          float delta = current - id(previous_pct);
+
+          // Deadband: ignore tiny changes (sensor noise / rounding)
+          const float eps = 0.4f;
+          const bool moving = fabsf(delta) >= eps;
+
+          // Expected direction: closing => delta positive, opening => delta negative
+          if (moving) {
+            const bool correct =
+              (want_closed && delta > 0.0f) ||
+              (want_open   && delta < 0.0f);
+
+            if (correct) {
+              id(wrong_way_streak) = 0;
+              id(stalled_streak) = 0;
+              ESP_LOGD("door", "Moving correct direction (delta %.2f).", delta);
+            } else {
+              id(wrong_way_streak) += 1;
+              ESP_LOGW("door", "Moving wrong direction (delta %.2f).", delta);
+            }
+          } else {
+            id(stalled_streak) += 1;
+            ESP_LOGD("door", "No significant movement (delta %.2f).", delta);
+          }
+
+          // Pulse rules:
+          // - require 2 consecutive wrong-direction readings OR 4 consecutive stalled readings (~12s)
+          // - require cooldown between pulses
+          const bool should_pulse = (id(wrong_way_streak) >= 2) || (id(stalled_streak) >= 4);
+          const bool cooldown_ok  = (now - id(last_pulse_ms)) > 8000;
+
+          if (should_pulse && cooldown_ok) {
+            ESP_LOGW("door", "Pulsing opener (wrong=%d stalled=%d).",
+                     id(wrong_way_streak), id(stalled_streak));
+            id(last_pulse_ms) = now;
+            id(wrong_way_streak) = 0;
+            id(stalled_streak) = 0;
+            id(pulse_garage).execute();
+          }
+
+          id(previous_pct) = current;
